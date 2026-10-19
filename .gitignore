@@ -1,0 +1,8 @@
+core/minivmm
+guests/*.bin
+.vmctl/
+*.qcow2
+*.iso
+__pycache__/
+*.pyc
+.vscode/
