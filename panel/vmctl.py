@@ -110,15 +110,33 @@ def is_running(vm):
     return state != "Z" and bool(argv) and argv[0].endswith(b"minivmm")
 
 
-def read_cpu_ticks(pid, tid=None):
-    """utime + stime (in clock ticks) of a process, or of one of its threads.
+# def read_cpu_ticks(pid, tid=None):
+#     """utime + stime (in clock ticks) of a process, or of one of its threads.
 
-    TODO (Part 4): parse /proc/<pid>/stat (or /proc/<pid>/task/<tid>/stat).
-    See `man 5 proc`: utime is field 14, stime is field 15. Careful: field 2
-    (comm) is in parentheses and may contain spaces, so split *after* the
-    last ')'. Convert ticks to seconds with CLK_TCK.
-    """
-    raise NotImplementedError("TODO: read_cpu_ticks")
+#     TODO (Part 4): parse /proc/<pid>/stat (or /proc/<pid>/task/<tid>/stat).
+#     See `man 5 proc`: utime is field 14, stime is field 15. Careful: field 2
+#     (comm) is in parentheses and may contain spaces, so split *after* the
+#     last ')'. Convert ticks to seconds with CLK_TCK.
+#     """
+#     raise NotImplementedError("TODO: read_cpu_ticks")
+
+
+
+def read_cpu_ticks(pid, tid=None):
+    if tid is None:
+        path = Path(f"/proc/{pid}/stat")
+    else:
+        path = Path(f"/proc/{pid}/task/{tid}/stat")
+
+    text = path.read_text()
+    fields = text.rsplit(")", 1)[1].split()
+
+    utime = int(fields[11])
+    stime = int(fields[12])
+
+    return utime + stime
+
+
 
 
 def read_mem_status(pid):
@@ -430,25 +448,133 @@ def cmd_stop(args):
         print("\n".join(tail))
 
 
+# def cmd_stats(args):
+#     """vmctl.py stats (NAME | --pid PID) [-i SEC] [-n COUNT]
+
+#     With --pid (Part 6), monitor that process instead of a VM from the state
+#     (e.g. a qemu-system-x86_64 you started by hand): same columns, the process
+#     is "alive" while /proc/<pid> exists, and there is no stats file.
+
+#     TODO (Part 4): every `interval` seconds print one line with:
+#       * the time
+#       * CPU%  = delta(utime+stime) / CLK_TCK / delta(wall seconds) * 100
+#                 (100% = one host CPU fully busy; 2 busy vCPUs => ~200%)
+#       * RSS and VSZ in MiB, and the number of threads (read_mem_status())
+#     Stop after `count` samples (0 = until Ctrl+C) or when the VM exits.
+
+#     Optional: per-thread CPU% (vcpu0=.., vcpu1=..) using read_threads(), and
+#     VM exits per second from the stats file (read_vm_stats(): total_exits,
+#     uptime_s).
+#     """
+#     raise NotImplementedError("TODO: cmd_stats")
+
+
 def cmd_stats(args):
-    """vmctl.py stats (NAME | --pid PID) [-i SEC] [-n COUNT]
+    if (args.name is None) == (args.pid is None):
+        raise VmctlError("provide either a VM name or --pid PID")
 
-    With --pid (Part 6), monitor that process instead of a VM from the state
-    (e.g. a qemu-system-x86_64 you started by hand): same columns, the process
-    is "alive" while /proc/<pid> exists, and there is no stats file.
+    if not 0 < args.interval < float("inf"):
+        raise VmctlError("--interval must be a positive finite number")
 
-    TODO (Part 4): every `interval` seconds print one line with:
-      * the time
-      * CPU%  = delta(utime+stime) / CLK_TCK / delta(wall seconds) * 100
-                (100% = one host CPU fully busy; 2 busy vCPUs => ~200%)
-      * RSS and VSZ in MiB, and the number of threads (read_mem_status())
-    Stop after `count` samples (0 = until Ctrl+C) or when the VM exits.
+    if args.count < 0:
+        raise VmctlError("--count must be zero or greater")
 
-    Optional: per-thread CPU% (vcpu0=.., vcpu1=..) using read_threads(), and
-    VM exits per second from the stats file (read_vm_stats(): total_exits,
-    uptime_s).
-    """
-    raise NotImplementedError("TODO: cmd_stats")
+    if args.pid is not None:
+        if args.pid <= 0:
+            raise VmctlError("--pid must be positive")
+
+        pid = args.pid
+        vm = None
+        label = f"Process {pid}"
+    else:
+        state = load_state()
+        vm = get_vm(state, args.name)
+
+        if not is_running(vm):
+            raise VmctlError(f"VM '{args.name}' is not running")
+
+        pid = vm["pid"]
+        label = (
+            f"VM '{args.name}': pid {pid}, "
+            f"{vm['vcpus']} vCPU, {vm['mem_mb']} MiB allocated"
+        )
+
+    def alive():
+        if vm is not None:
+            return is_running(vm)
+        return Path(f"/proc/{pid}").exists()
+
+    if not alive():
+        raise VmctlError(f"process {pid} does not exist")
+
+    print(f"{label} (100% CPU = one host logical CPU)", flush=True)
+    print(
+        f"{'TIME':<10} {'CPU%':>8} {'RSS(MiB)':>12} "
+        f"{'VSZ(MiB)':>12} {'THR':>6}",
+        flush=True,
+    )
+
+    samples = 0
+
+    try:
+        previous_ticks = read_cpu_ticks(pid)
+        previous_time = time.monotonic()
+
+        while args.count == 0 or samples < args.count:
+            if not alive():
+                break
+
+            time.sleep(args.interval)
+
+            if not alive():
+                break
+
+            current_ticks = read_cpu_ticks(pid)
+            memory = read_mem_status(pid)
+            current_time = time.monotonic()
+
+            elapsed = current_time - previous_time
+            cpu_percent = (
+                (current_ticks - previous_ticks)
+                / CLK_TCK
+                / elapsed
+                * 100.0
+            )
+
+            rss_mib = memory.get("VmRSS", 0) / 1024.0
+            vsz_mib = memory.get("VmSize", 0) / 1024.0
+            threads = memory.get("Threads", 0)
+            timestamp = time.strftime("%H:%M:%S")
+
+            print(
+                f"{timestamp:<10} {cpu_percent:>8.1f} "
+                f"{rss_mib:>12.1f} {vsz_mib:>12.1f} "
+                f"{threads:>6}",
+                flush=True,
+            )
+
+            previous_ticks = current_ticks
+            previous_time = current_time
+            samples += 1
+
+    except (FileNotFoundError, ProcessLookupError):
+        print(f"\nProcess {pid} exited.", flush=True)
+        return
+    except PermissionError as exc:
+        raise VmctlError(f"cannot read process {pid}: {exc}") from exc
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped.", flush=True)
+        return
+
+    if not alive():
+        print(f"\nProcess {pid} exited.", flush=True)
+
+
+
+
+
+
+
 
 
 def cmd_resize(args):
