@@ -577,18 +577,69 @@ def cmd_stats(args):
 
 
 
-def cmd_resize(args):
-    """vmctl.py resize NAME [--mem MiB] [--vcpus N] [--overcommit] [--restart]
+# def cmd_resize(args):
+#     """vmctl.py resize NAME [--mem MiB] [--vcpus N] [--overcommit] [--restart]
 
-    TODO (Part 5): compute the new values (keep the old ones if an option is not
-    given) and validate them. minivmm can only be resized *cold*:
-      * VM not running        -> just update and save the definition
-      * running, no --restart -> refuse with a clear error
-      * running, --restart    -> stop_vm(), update + save, start_vm()
-                                 (start_vm() already calls admit())
-    Print old -> new values.
-    """
-    raise NotImplementedError("TODO: cmd_resize")
+#     TODO (Part 5): compute the new values (keep the old ones if an option is not
+#     given) and validate them. minivmm can only be resized *cold*:
+#       * VM not running        -> just update and save the definition
+#       * running, no --restart -> refuse with a clear error
+#       * running, --restart    -> stop_vm(), update + save, start_vm()
+#                                  (start_vm() already calls admit())
+#     Print old -> new values.
+#     """
+#     raise NotImplementedError("TODO: cmd_resize")
+
+
+
+def cmd_resize(args):
+    state = load_state()
+    vm = get_vm(state, args.name)
+
+    old_mem = vm["mem_mb"]
+    old_vcpus = vm["vcpus"]
+
+    new_mem = args.mem if args.mem is not None else old_mem
+    new_vcpus = args.vcpus if args.vcpus is not None else old_vcpus
+    overcommit = args.overcommit or vm.get("overcommit", False)
+
+    validate_resources(new_mem, new_vcpus, overcommit)
+
+    running = is_running(vm)
+
+    if running and not args.restart:
+        raise VmctlError(
+            f"VM '{args.name}' is running; "
+            "use --restart for a cold resize"
+        )
+
+    if running:
+        # Check admission before stopping the current VM.
+        admit(state, args.name, new_mem)
+        stop_vm(state, args.name)
+
+    vm["mem_mb"] = new_mem
+    vm["vcpus"] = new_vcpus
+    vm["overcommit"] = overcommit
+    save_state(state)
+
+    print(
+        f"resized VM '{args.name}': "
+        f"memory {old_mem} -> {new_mem} MiB, "
+        f"vCPUs {old_vcpus} -> {new_vcpus}"
+    )
+
+    if running:
+        proc = start_vm(state, args.name)
+        print(f"restarted VM '{args.name}' as pid {proc.pid}")
+
+        time.sleep(0.3)
+
+        if proc.poll() is not None and proc.returncode != 0:
+            raise VmctlError(
+                f"VM '{args.name}' failed after restart; "
+                f"check: vmctl.py logs {args.name}"
+            )
 
 
 def cmd_logs(args):
