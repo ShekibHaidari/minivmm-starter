@@ -180,31 +180,123 @@ def admit(state, name, mem_mb):
 # Commands                                                                     #
 # --------------------------------------------------------------------------- #
 
-def cmd_create(args):
-    """vmctl.py create NAME --guest FILE [--mem MiB] [--vcpus N] [--overcommit]
+# def cmd_create(args):
+#     """vmctl.py create NAME --guest FILE [--mem MiB] [--vcpus N] [--overcommit]
 
-    TODO (Part 3): validate the name (NAME_RE), refuse duplicates, check that the
-    guest file exists (store its absolute path), call validate_resources(),
-    then add an entry to the state and save it. Suggested entry fields:
-    name, guest, mem_mb, vcpus, overcommit, pid (None), created_at, started_at.
-    """
-    raise NotImplementedError("TODO: cmd_create")
+#     TODO (Part 3): validate the name (NAME_RE), refuse duplicates, check that the
+#     guest file exists (store its absolute path), call validate_resources(),
+#     then add an entry to the state and save it. Suggested entry fields:
+#     name, guest, mem_mb, vcpus, overcommit, pid (None), created_at, started_at.
+#     """
+#     raise NotImplementedError("TODO: cmd_create")
+
+
+
+def cmd_create(args):
+    state = load_state()
+
+    if not NAME_RE.fullmatch(args.name):
+        raise VmctlError(
+            "name must start with a letter and contain only "
+            "letters, digits, '_' or '-' (maximum 32 characters)"
+        )
+
+    if args.name in state:
+        raise VmctlError(f"VM '{args.name}' already exists")
+
+    guest = Path(args.guest).expanduser().resolve()
+    if not guest.is_file():
+        raise VmctlError(f"guest file does not exist: {guest}")
+
+    validate_resources(args.mem, args.vcpus, args.overcommit)
+
+    state[args.name] = {
+        "name": args.name,
+        "guest": str(guest),
+        "mem_mb": args.mem,
+        "vcpus": args.vcpus,
+        "overcommit": args.overcommit,
+        "pid": None,
+        "created_at": time.time(),
+        "started_at": None,
+    }
+
+    save_state(state)
+
+    print(
+        f"created VM '{args.name}': "
+        f"{args.vcpus} vCPU, {args.mem} MiB, guest={guest.name}"
+    )
+
+
+# def start_vm(state, name):
+#     """Start the minivmm process for VM `name`; return the subprocess.Popen.
+
+#     TODO (Part 3):
+#       * refuse if it is already running; check CORE_BIN exists
+#       * re-validate resources and call admit() (admission control)
+#       * build the command line:
+#             core/minivmm --mem M --vcpus N --stats <stats_path(name)> <guest>
+#       * start it with subprocess.Popen, stdout+stderr redirected to
+#         log_path(name), stdin=DEVNULL, start_new_session=True (so the VM
+#         survives the panel exiting and does not get the panel's Ctrl+C)
+#       * store the pid (and start time) in the state and save it
+#     """
+#     raise NotImplementedError("TODO: start_vm")
+
 
 
 def start_vm(state, name):
-    """Start the minivmm process for VM `name`; return the subprocess.Popen.
+    vm = get_vm(state, name)
 
-    TODO (Part 3):
-      * refuse if it is already running; check CORE_BIN exists
-      * re-validate resources and call admit() (admission control)
-      * build the command line:
-            core/minivmm --mem M --vcpus N --stats <stats_path(name)> <guest>
-      * start it with subprocess.Popen, stdout+stderr redirected to
-        log_path(name), stdin=DEVNULL, start_new_session=True (so the VM
-        survives the panel exiting and does not get the panel's Ctrl+C)
-      * store the pid (and start time) in the state and save it
-    """
-    raise NotImplementedError("TODO: start_vm")
+    if is_running(vm):
+        raise VmctlError(f"VM '{name}' is already running")
+
+    if not CORE_BIN.is_file():
+        raise VmctlError(f"minivmm executable not found: {CORE_BIN}; run make")
+
+    if not os.access(CORE_BIN, os.X_OK):
+        raise VmctlError(f"minivmm is not executable: {CORE_BIN}")
+
+    if not Path(vm["guest"]).is_file():
+        raise VmctlError(f"guest file does not exist: {vm['guest']}")
+
+    validate_resources(
+        vm["mem_mb"], vm["vcpus"], vm.get("overcommit", False)
+    )
+    admit(state, name, vm["mem_mb"])
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        str(CORE_BIN),
+        "--mem", str(vm["mem_mb"]),
+        "--vcpus", str(vm["vcpus"]),
+        "--stats", str(stats_path(name).resolve()),
+        vm["guest"],
+    ]
+
+    try:
+        stats_path(name).unlink(missing_ok=True)
+
+        with open(log_path(name), "w") as log:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        raise VmctlError(f"cannot start VM '{name}': {exc}") from exc
+
+    vm["pid"] = proc.pid
+    vm["started_at"] = time.time()
+    save_state(state)
+
+    return proc
+
+
 
 
 def cmd_run(args):
@@ -244,23 +336,90 @@ def vm_status(name, vm):
     return stats["state"] if stats else "exited"
 
 
-def cmd_list(args):
-    """vmctl.py list — one row per VM: NAME STATE PID VCPUS MEM GUEST.
+# def cmd_list(args):
+#     """vmctl.py list — one row per VM: NAME STATE PID VCPUS MEM GUEST.
 
-    TODO (Part 3): use vm_status() for the STATE column; show the PID only for
-    running VMs.
-    """
-    raise NotImplementedError("TODO: cmd_list")
+#     TODO (Part 3): use vm_status() for the STATE column; show the PID only for
+#     running VMs.
+#     """
+#     raise NotImplementedError("TODO: cmd_list")
+
+
+def cmd_list(args):
+    state = load_state()
+
+    print(
+        f"{'NAME':<32} {'STATE':<10} {'PID':>8} "
+        f"{'VCPUS':>6} {'MEM(MiB)':>10}  GUEST"
+    )
+
+    for name, vm in sorted(state.items()):
+        status = vm_status(name, vm)
+        pid = str(vm["pid"]) if status == "running" else "-"
+
+        print(
+            f"{name:<32} {status:<10} {pid:>8} "
+            f"{vm['vcpus']:>6} {vm['mem_mb']:>10}  "
+            f"{Path(vm['guest']).name}"
+        )
+
+
+# def stop_vm(state, name, timeout=5.0):
+#     """Stop a running VM gracefully; return True if it was running.
+
+#     TODO (Part 3): send SIGTERM (minivmm then kicks its vCPUs out of KVM_RUN,
+#     prints the exit table and exits). Poll is_running() for up to `timeout`
+#     seconds; if it is still alive, send SIGKILL.
+#     """
+#     raise NotImplementedError("TODO: stop_vm")
+
 
 
 def stop_vm(state, name, timeout=5.0):
-    """Stop a running VM gracefully; return True if it was running.
+    vm = get_vm(state, name)
 
-    TODO (Part 3): send SIGTERM (minivmm then kicks its vCPUs out of KVM_RUN,
-    prints the exit table and exits). Poll is_running() for up to `timeout`
-    seconds; if it is still alive, send SIGKILL.
-    """
-    raise NotImplementedError("TODO: stop_vm")
+    if not is_running(vm):
+        print(f"VM '{name}' is not running")
+        return False
+
+    pid = vm["pid"]
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print(f"VM '{name}' has already exited")
+        return False
+    except PermissionError as exc:
+        raise VmctlError(f"cannot stop VM '{name}': {exc}") from exc
+
+    deadline = time.monotonic() + timeout
+
+    while is_running(vm) and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    forced = False
+
+    if is_running(vm):
+        try:
+            os.kill(pid, signal.SIGKILL)
+            forced = True
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise VmctlError(f"cannot kill VM '{name}': {exc}") from exc
+
+        deadline = time.monotonic() + 1.0
+
+        while is_running(vm) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        if is_running(vm):
+            raise VmctlError(f"VM '{name}' has not exited after SIGKILL")
+
+    suffix = " using SIGKILL" if forced else ""
+    print(f"stopped VM '{name}' (pid {pid}){suffix}")
+
+    return True
 
 
 def cmd_stop(args):
