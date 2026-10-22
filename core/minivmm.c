@@ -118,18 +118,33 @@ static const char *exit_reason_name(unsigned r)
     }
 }
 
+// static void count_exit(struct vcpu *v, unsigned reason)
+// {
+//     /*
+//      * TODO 3 (Part 2): count this VM exit in v->exits[reason].
+//      *   - guard against reason >= NR_EXIT_REASONS (count it as KVM_EXIT_UNKNOWN)
+//      *   - write_stats() and the control panel read these counters from another
+//      *     thread while vCPUs are running, so increment them atomically, e.g.
+//      *     atomic_fetch_add_explicit(..., 1, memory_order_relaxed)
+//      */
+//     (void)v;
+//     (void)reason;
+// }
+
+
 static void count_exit(struct vcpu *v, unsigned reason)
 {
-    /*
-     * TODO 3 (Part 2): count this VM exit in v->exits[reason].
-     *   - guard against reason >= NR_EXIT_REASONS (count it as KVM_EXIT_UNKNOWN)
-     *   - write_stats() and the control panel read these counters from another
-     *     thread while vCPUs are running, so increment them atomically, e.g.
-     *     atomic_fetch_add_explicit(..., 1, memory_order_relaxed)
-     */
-    (void)v;
-    (void)reason;
+    if (reason >= NR_EXIT_REASONS)
+        reason = KVM_EXIT_UNKNOWN;
+
+    atomic_fetch_add_explicit(&v->exits[reason], 1,
+                              memory_order_relaxed);
 }
+
+
+
+
+
 
 static uint64_t exits_of(struct vcpu *v, unsigned reason)
 {
@@ -154,15 +169,77 @@ static double uptime(struct vm *vm)
  *   HLT                         1            1            2
  *   TOTAL                      55            1           56
  */
+
+
+
+// static void print_exit_table(struct vm *vm)
+// {
+//     /*
+//      * TODO 4 (Part 2): print the table described above.
+//      *   Hints: iterate r over 0..NR_EXIT_REASONS-1, read counters with
+//      *   exits_of(), name rows with exit_reason_name(), skip all-zero rows.
+//      */
+//     fprintf(stderr, "\n[minivmm] VM ran for %.2f s (exit table not implemented yet)\n", uptime(vm));
+// }
+
+
+
 static void print_exit_table(struct vm *vm)
 {
-    /*
-     * TODO 4 (Part 2): print the table described above.
-     *   Hints: iterate r over 0..NR_EXIT_REASONS-1, read counters with
-     *   exits_of(), name rows with exit_reason_name(), skip all-zero rows.
-     */
-    fprintf(stderr, "\n[minivmm] VM ran for %.2f s (exit table not implemented yet)\n", uptime(vm));
+    uint64_t per_vcpu[MAX_VCPUS] = {0};
+    uint64_t grand_total = 0;
+
+    fprintf(stderr,
+            "\n[minivmm] ===== VM exits seen by userspace (%.2f s) =====\n",
+            uptime(vm));
+
+    fprintf(stderr, "%-20s", "reason");
+
+    for (int i = 0; i < vm->nr_vcpus; i++) {
+        char label[16];
+        snprintf(label, sizeof(label), "vcpu%d", i);
+        fprintf(stderr, " %12s", label);
+    }
+
+    fprintf(stderr, " %12s\n", "total");
+
+    for (unsigned r = 0; r < NR_EXIT_REASONS; r++) {
+        uint64_t counts[MAX_VCPUS] = {0};
+        uint64_t row_total = 0;
+
+        for (int i = 0; i < vm->nr_vcpus; i++) {
+            counts[i] = exits_of(&vm->vcpus[i], r);
+            row_total += counts[i];
+        }
+
+        if (row_total == 0)
+            continue;
+
+        fprintf(stderr, "%-20s", exit_reason_name(r));
+
+        for (int i = 0; i < vm->nr_vcpus; i++) {
+            fprintf(stderr, " %12llu",
+                    (unsigned long long)counts[i]);
+            per_vcpu[i] += counts[i];
+        }
+
+        fprintf(stderr, " %12llu\n",
+                (unsigned long long)row_total);
+        grand_total += row_total;
+    }
+
+    fprintf(stderr, "%-20s", "TOTAL");
+
+    for (int i = 0; i < vm->nr_vcpus; i++)
+        fprintf(stderr, " %12llu",
+                (unsigned long long)per_vcpu[i]);
+
+    fprintf(stderr, " %12llu\n",
+            (unsigned long long)grand_total);
 }
+
+
+
 
 /*
  * Writes the live statistics as JSON to vm->stats_path (atomically, via
@@ -212,32 +289,72 @@ static void write_stats(struct vm *vm, const char *state)
 /* Device emulation: this is the "emulate" half of trap-and-emulate           */
 /* ------------------------------------------------------------------------- */
 
+// static void handle_io(struct vcpu *v)
+// {
+//     struct kvm_run *run = v->run;
+//     /*
+//      * TODO 2 (Part 1): emulate the port I/O that made the guest exit.
+//      *
+//      * The kernel describes the access in run->io:
+//      *   run->io.direction  KVM_EXIT_IO_OUT (guest wrote) or KVM_EXIT_IO_IN (guest reads)
+//      *   run->io.port       I/O port number
+//      *   run->io.size       bytes per access (1, 2 or 4)
+//      *   run->io.count      number of accesses (> 1 only for rep ins/outs)
+//      *   run->io.data_offset  the data itself is at (uint8_t *)run + data_offset
+//      *
+//      * Implement the guest ABI documented at the top of this file:
+//      *   OUT PORT_COM1_DATA : write the byte(s) to stdout and fflush() it.
+//      *                        Several vCPUs may print at once: hold serial_lock.
+//      *   OUT PORT_HEARTBEAT : do nothing (it is only counted).
+//      *   other OUT          : print a warning on stderr and ignore it.
+//      *   IN  PORT_COM1_LSR  : fill the data with 0x20 (transmitter ready).
+//      *   other IN           : fill the data with 0xff.
+//      *
+//      * When you return, the next KVM_RUN resumes the guest *after* the IN/OUT
+//      * instruction (for IN, with the value you placed in the data buffer).
+//      */
+//     (void)run;
+// }
+
 static void handle_io(struct vcpu *v)
 {
     struct kvm_run *run = v->run;
-    /*
-     * TODO 2 (Part 1): emulate the port I/O that made the guest exit.
-     *
-     * The kernel describes the access in run->io:
-     *   run->io.direction  KVM_EXIT_IO_OUT (guest wrote) or KVM_EXIT_IO_IN (guest reads)
-     *   run->io.port       I/O port number
-     *   run->io.size       bytes per access (1, 2 or 4)
-     *   run->io.count      number of accesses (> 1 only for rep ins/outs)
-     *   run->io.data_offset  the data itself is at (uint8_t *)run + data_offset
-     *
-     * Implement the guest ABI documented at the top of this file:
-     *   OUT PORT_COM1_DATA : write the byte(s) to stdout and fflush() it.
-     *                        Several vCPUs may print at once: hold serial_lock.
-     *   OUT PORT_HEARTBEAT : do nothing (it is only counted).
-     *   other OUT          : print a warning on stderr and ignore it.
-     *   IN  PORT_COM1_LSR  : fill the data with 0x20 (transmitter ready).
-     *   other IN           : fill the data with 0xff.
-     *
-     * When you return, the next KVM_RUN resumes the guest *after* the IN/OUT
-     * instruction (for IN, with the value you placed in the data buffer).
-     */
-    (void)run;
+    uint8_t *data = (uint8_t *)run + run->io.data_offset;
+    size_t length = (size_t)run->io.size * run->io.count;
+
+    if (run->io.direction == KVM_EXIT_IO_OUT) {
+        switch (run->io.port) {
+        case PORT_COM1_DATA:
+            pthread_mutex_lock(&serial_lock);
+            fwrite(data, 1, length, stdout);
+            fflush(stdout);
+            pthread_mutex_unlock(&serial_lock);
+            break;
+
+        case PORT_HEARTBEAT:
+            /* The run loop already counted this I/O exit. */
+            break;
+
+        default:
+            fprintf(stderr,
+                    "[minivmm] vcpu%d: OUT to unknown port 0x%x ignored\n",
+                    v->id, (unsigned)run->io.port);
+            break;
+        }
+    } else if (run->io.direction == KVM_EXIT_IO_IN) {
+        memset(data,
+               run->io.port == PORT_COM1_LSR ? 0x20 : 0xff,
+               length);
+    }
 }
+
+
+
+
+
+
+
+
 
 static void handle_mmio(struct vcpu *v)
 {
@@ -252,6 +369,67 @@ static void handle_mmio(struct vcpu *v)
 /* The vCPU run loop                                                          */
 /* ------------------------------------------------------------------------- */
 
+// static void vcpu_loop(struct vcpu *v)
+// {
+//     struct kvm_run *run = v->run;
+
+//     for (;;) {
+//         if (atomic_load(&stop_requested))
+//             return;
+
+//         /*
+//          * TODO 1a (Part 1): enter the guest with the KVM_RUN ioctl on the vCPU fd
+//          * (VM entry: root -> non-root mode). It only returns when the guest
+//          * does something the kernel cannot handle alone (a VM exit that must
+//          * be emulated in userspace) or when a signal interrupts it.
+//          *   - On failure with errno EINTR or EAGAIN, a signal (e.g. our own
+//          *     kick from kick_vcpus()) interrupted the guest: count it as
+//          *     KVM_EXIT_INTR and `continue` (the loop re-checks stop_requested).
+//          *   - On any other failure: perror(), set vm_failed, return.
+//          * TODO 3 (second half): after a successful KVM_RUN, call
+//          *   count_exit(v, run->exit_reason).
+//          */
+
+//         switch (run->exit_reason) {
+//         /*
+//          * TODO 1b (Part 1): handle the two exits our guests rely on:
+//          *   KVM_EXIT_HLT : the guest executed HLT, i.e. this vCPU has finished.
+//          *                  End this vCPU's loop (return).
+//          *   KVM_EXIT_IO  : the guest executed IN/OUT. Call handle_io(v) and
+//          *                  keep looping so the guest is resumed.
+//          */
+
+//         case KVM_EXIT_MMIO:
+//             handle_mmio(v);
+//             break;
+
+//         case KVM_EXIT_SHUTDOWN:
+//             fprintf(stderr, "[minivmm] vcpu%d: SHUTDOWN (triple fault)\n", v->id);
+//             atomic_store(&vm_failed, 1);
+//             return;
+
+//         case KVM_EXIT_FAIL_ENTRY:
+//             fprintf(stderr, "[minivmm] vcpu%d: FAIL_ENTRY, hardware reason 0x%llx\n", v->id,
+//                     (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
+//             atomic_store(&vm_failed, 1);
+//             return;
+
+//         case KVM_EXIT_INTERNAL_ERROR:
+//             fprintf(stderr, "[minivmm] vcpu%d: INTERNAL_ERROR, suberror %u\n", v->id,
+//                     run->internal.suberror);
+//             atomic_store(&vm_failed, 1);
+//             return;
+
+//         default:
+//             fprintf(stderr, "[minivmm] vcpu%d: unhandled exit reason %u (%s)\n", v->id,
+//                     run->exit_reason, exit_reason_name(run->exit_reason));
+//             atomic_store(&vm_failed, 1);
+//             return;
+//         }
+//     }
+// }
+
+
 static void vcpu_loop(struct vcpu *v)
 {
     struct kvm_run *run = v->run;
@@ -260,57 +438,89 @@ static void vcpu_loop(struct vcpu *v)
         if (atomic_load(&stop_requested))
             return;
 
-        /*
-         * TODO 1a (Part 1): enter the guest with the KVM_RUN ioctl on the vCPU fd
-         * (VM entry: root -> non-root mode). It only returns when the guest
-         * does something the kernel cannot handle alone (a VM exit that must
-         * be emulated in userspace) or when a signal interrupts it.
-         *   - On failure with errno EINTR or EAGAIN, a signal (e.g. our own
-         *     kick from kick_vcpus()) interrupted the guest: count it as
-         *     KVM_EXIT_INTR and `continue` (the loop re-checks stop_requested).
-         *   - On any other failure: perror(), set vm_failed, return.
-         * TODO 3 (second half): after a successful KVM_RUN, call
-         *   count_exit(v, run->exit_reason).
-         */
+        if (ioctl(v->fd, KVM_RUN, 0) < 0) {
+            if (errno == EINTR || errno == EAGAIN) {
+                count_exit(v, KVM_EXIT_INTR);
+                continue;
+            }
+
+            perror("KVM_RUN");
+            atomic_store(&vm_failed, 1);
+            return;
+        }
+
+        count_exit(v, run->exit_reason);
 
         switch (run->exit_reason) {
-        /*
-         * TODO 1b (Part 1): handle the two exits our guests rely on:
-         *   KVM_EXIT_HLT : the guest executed HLT, i.e. this vCPU has finished.
-         *                  End this vCPU's loop (return).
-         *   KVM_EXIT_IO  : the guest executed IN/OUT. Call handle_io(v) and
-         *                  keep looping so the guest is resumed.
-         */
+        case KVM_EXIT_HLT:
+            return;
+
+        case KVM_EXIT_IO:
+            handle_io(v);
+            break;
+
+        case KVM_EXIT_INTR:
+            break;
 
         case KVM_EXIT_MMIO:
             handle_mmio(v);
             break;
 
         case KVM_EXIT_SHUTDOWN:
-            fprintf(stderr, "[minivmm] vcpu%d: SHUTDOWN (triple fault)\n", v->id);
+            fprintf(stderr,
+                    "[minivmm] vcpu%d: SHUTDOWN (triple fault)\n",
+                    v->id);
             atomic_store(&vm_failed, 1);
             return;
 
         case KVM_EXIT_FAIL_ENTRY:
-            fprintf(stderr, "[minivmm] vcpu%d: FAIL_ENTRY, hardware reason 0x%llx\n", v->id,
-                    (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
+            fprintf(stderr,
+                    "[minivmm] vcpu%d: FAIL_ENTRY, hardware reason 0x%llx\n",
+                    v->id,
+                    (unsigned long long)
+                    run->fail_entry.hardware_entry_failure_reason);
             atomic_store(&vm_failed, 1);
             return;
 
         case KVM_EXIT_INTERNAL_ERROR:
-            fprintf(stderr, "[minivmm] vcpu%d: INTERNAL_ERROR, suberror %u\n", v->id,
-                    run->internal.suberror);
+            fprintf(stderr,
+                    "[minivmm] vcpu%d: INTERNAL_ERROR, suberror %u\n",
+                    v->id, run->internal.suberror);
             atomic_store(&vm_failed, 1);
             return;
 
         default:
-            fprintf(stderr, "[minivmm] vcpu%d: unhandled exit reason %u (%s)\n", v->id,
-                    run->exit_reason, exit_reason_name(run->exit_reason));
+            fprintf(stderr,
+                    "[minivmm] vcpu%d: unhandled exit reason %u (%s)\n",
+                    v->id, run->exit_reason,
+                    exit_reason_name(run->exit_reason));
             atomic_store(&vm_failed, 1);
             return;
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 static void *vcpu_thread(void *arg)
 {
