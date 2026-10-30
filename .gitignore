@@ -6,3 +6,11 @@ guests/*.bin
 __pycache__/
 *.pyc
 .vscode/
+# Generated files
+/core/minivmm
+/guests/*.bin
+/.vmctl/
+__pycache__/
+*.pyc
+*.iso
+*.qcow2
